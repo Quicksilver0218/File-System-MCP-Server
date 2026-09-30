@@ -229,7 +229,7 @@ export async function readFile(
     let offset = 0;
     let lineCount = 1;
     let textLength = 0;
-    let truncatedAt;
+    let truncatedAt: Record<string, number> | undefined;
     let truncated = false;
     const notes = [];
     const lines = [];
@@ -245,7 +245,6 @@ export async function readFile(
         if (nullPos !== -1)
           notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled - use read_media_file for images or audio.`);
       }
-      offset += result.bytesRead;
       const text = decoder.decode(bytes);
 
       let chunkLineCount = 0;
@@ -305,22 +304,18 @@ export async function readFile(
               let col = pendingLine.length;
               if (lineCount === startLine && startCol)
                 col += startCol;
-              if (firstLineBreakPos)
-                truncatedAt = {
-                  line: lineCount,
-                  col,
-                  lineLength,
-                  nextLine: lineCount,
-                  nextCol: col
-                };
-              else
-                truncatedAt = {
-                  line: lineCount,
-                  col,
-                  lineLength,
-                  nextLine: lineCount + 1,
-                  nextCol: 0
-                };
+              truncatedAt = {
+                line: lineCount,
+                col,
+                lineLength,
+              };
+              if (firstLineBreakPos) {
+                truncatedAt.nextLine = lineCount;
+                truncatedAt.nextCol = col;
+              } else {
+                truncatedAt.nextLine = lineCount + 1;
+                truncatedAt.nextCol = 0;
+              }
             }
             truncated = true;
           }
@@ -355,6 +350,7 @@ export async function readFile(
           };
         }
       }
+      offset += result.bytesRead;
     }
 
     if (truncatedAt) {
