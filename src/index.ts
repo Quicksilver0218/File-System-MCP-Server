@@ -2,7 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RegisteredTool, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  ErrorCode,
+  McpError,
   RootsListChangedNotificationSchema,
+  ToolAnnotations,
   type Root,
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
@@ -10,8 +13,8 @@ import path from "path";
 import { pathToFileURL } from "url";
 import { z } from "zod";
 import { minimatch } from "minimatch";
-import { normalizePath, expandHome } from './path-utils.js';
-import { getValidRootDirectories } from './roots-utils.js';
+import { normalizePath, expandHome } from './path-utils';
+import { getValidRootDirectories } from './roots-utils';
 import {
   // Function imports
   formatSize,
@@ -26,6 +29,7 @@ import {
   setAllowedDirectories,
   editFile,
 } from './lib.js';
+import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -211,9 +215,69 @@ const server = new McpServer(
   }
 );
 
+function checkSnakeCaseKeys<T>(toolName: string, obj: T, schema: unknown) {
+  if (!schema || typeof obj !== 'object')
+    return;
+  if (Array.isArray(obj)) {
+    if (!(schema instanceof z.ZodArray))
+      return;
+    obj.forEach(item => checkSnakeCaseKeys(toolName, item, schema.element));
+  }
+  if (!(schema instanceof z.ZodObject))
+    return;
+  const shape = schema.shape;
+  const keys = new Set(Object.keys(obj as object));
+  for (const key of keys) {
+    const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+    if (!shape[key] && shape[camelKey] && !keys.has(camelKey))
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Input validation error: Invalid arguments for tool ${toolName}: Unrecognized key: "${key}". Do you mean "${camelKey}"?`
+      );
+  }
+}
+
+const registerTool = <
+  OutputArgs extends ZodRawShapeCompat | AnySchema,
+  InputArgs extends undefined | ZodRawShapeCompat | AnySchema = undefined
+>(
+  name: string,
+  config: {
+    title?: string;
+    description?: string;
+    inputSchema: InputArgs;
+    outputSchema?: OutputArgs;
+    annotations?: ToolAnnotations;
+    _meta?: Record<string, unknown>;
+  },
+  cb: ToolCallback<InputArgs>
+): RegisteredTool => {
+  const { title, description, inputSchema, outputSchema, annotations, _meta } = config;
+  if (inputSchema instanceof z.ZodObject) {
+    const origRun = inputSchema._zod.run.bind(inputSchema._zod);
+    inputSchema._zod.run = (payload, ctx) => {
+      checkSnakeCaseKeys(name, payload.value, inputSchema);
+      return origRun(payload, ctx);
+    };
+  }
+
+  return server.registerTool(
+    name,
+    {
+      title,
+      description,
+      inputSchema,
+      outputSchema,
+      annotations,
+      _meta
+    },
+    cb
+  );
+};
+
 // Tool registrations
 
-server.registerTool(
+registerTool(
   "read_text_file",
   {
     title: "Read Text File",
@@ -257,7 +321,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "edit_text_file",
   {
     title: "Edit Text File",
@@ -282,7 +346,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "read_media_file",
   {
     title: "Read Media File",
@@ -350,7 +414,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "read_multiple_files",
   {
     title: "Read Multiple Files",
@@ -385,7 +449,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "write_file",
   {
     title: "Write File",
@@ -395,7 +459,7 @@ server.registerTool(
       "Handles text content with proper encoding.",
     inputSchema: WriteFileArgsSchema,
     outputSchema: { content: z.string() },
-    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: true, openWorldHint: false }
+    annotations: { idempotentHint: true, destructiveHint: true, openWorldHint: false }
   },
   async (args: z.infer<typeof WriteFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
@@ -408,7 +472,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "edit_file",
   {
     title: "Edit File",
@@ -417,7 +481,7 @@ server.registerTool(
       "with new content. Returns a git-style diff showing the changes made.",
     inputSchema: EditFileArgsSchema,
     outputSchema: { content: z.string() },
-    annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false }
+    annotations: { destructiveHint: true, openWorldHint: false }
   },
   async (args: z.infer<typeof EditFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
@@ -429,7 +493,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "create_directory",
   {
     title: "Create Directory",
@@ -440,7 +504,7 @@ server.registerTool(
       "structures for projects or ensuring required paths exist.",
     inputSchema: CreateDirectoryArgsSchema,
     outputSchema: { content: z.string() },
-    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false }
+    annotations: { idempotentHint: true, openWorldHint: false }
   },
   async (args: z.infer<typeof CreateDirectoryArgsSchema>) => {
     const validPath = await validatePath(args.path);
@@ -453,7 +517,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "list_directory",
   {
     title: "List Directory",
@@ -479,7 +543,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "list_directory_with_sizes",
   {
     title: "List Directory with Sizes",
@@ -554,7 +618,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "directory_tree",
   {
     title: "Directory Tree",
@@ -621,7 +685,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "move_file",
   {
     title: "Move File",
@@ -632,7 +696,7 @@ server.registerTool(
       "for simple renaming within the same directory.",
     inputSchema: MoveFileArgsSchema,
     outputSchema: { content: z.string() },
-    annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false }
+    annotations: { destructiveHint: true, openWorldHint: false }
   },
   async (args: z.infer<typeof MoveFileArgsSchema>) => {
     const validSourcePath = await validatePath(args.source);
@@ -647,7 +711,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "search_files",
   {
     title: "Search Files",
@@ -671,7 +735,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "get_file_info",
   {
     title: "Get File Info",
@@ -697,7 +761,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerTool(
   "list_allowed_directories",
   {
     title: "List Allowed Directories",
