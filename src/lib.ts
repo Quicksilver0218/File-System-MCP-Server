@@ -203,6 +203,7 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 export interface FileReadResult extends Record<string, unknown> {
   fileSize: number;
   totalLines: number;
+  lineEnding?: '\r' | '\n' | '\r\n' | 'Mixed';
   truncatedAt?: {
     line: number;
     col: number;
@@ -221,6 +222,9 @@ export async function readFile(
   options: { startLine?: number; endLine?: number, startCol?: number; maxSize?: number } = {}
 ): Promise<FileReadResult> {
   const { startLine = 1, endLine, startCol, maxSize = 25000 } = options;
+  if (endLine && endLine < startLine)
+    throw new Error("endLine must be greater than or equal to startLine");
+
   const fileHandle = await fs.open(filePath, 'r');
   try {
     let pendingLine = '';
@@ -228,6 +232,7 @@ export async function readFile(
     const decoder = new TextDecoder();
     let offset = 0;
     let lineCount = 1;
+    let lineEnding: '\r' | '\n' | '\r\n' | 'Mixed' | undefined;
     let textLength = 0;
     let truncatedAt: Record<string, number> | undefined;
     let truncated = false;
@@ -250,7 +255,7 @@ export async function readFile(
       let chunkLineCount = 0;
       let firstLineBreakPos, lastLineBreakPos;
       for (let i = 0; i < text.length; i++)
-        if (text[i] === '\n') {
+        if (text[i] === '\n' && text[i - 1] !== '\r' || text[i] === '\r') {
           chunkLineCount++;
           if (firstLineBreakPos === undefined)
             firstLineBreakPos = i;
@@ -259,45 +264,54 @@ export async function readFile(
       let remainingText;
       if (chunkLineCount) {
         if (lineCount + chunkLineCount > startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
-          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split('\n');
-          for (let line of completeLines) {
-            if (lineCount >= startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
-              line += '\n';
-              lineLength = line.length;
-              let colOffset;
-              if (lineCount === startLine && startCol) {
-                line = line.slice(startCol);
-                colOffset = startCol;
-              } else
-                colOffset = 0;
-              if (textLength + line.length > maxSize) {
-                line = line.slice(0, maxSize - textLength);
-                truncatedAt = {
-                  line: lineCount,
-                  col: colOffset + line.length,
-                  lineLength,
-                  nextLine: lineCount,
-                  nextCol: colOffset + line.length,
-                };
-                truncated = true;
-              } else if (textLength + line.length === maxSize) {
-                truncatedAt = {
-                  line: lineCount,
-                  col: colOffset + line.length,
-                  lineLength,
-                  nextLine: lineCount + 1,
-                  nextCol: 0,
-                };
-                truncated = true;
+          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split(/(\r\n|\r|\n)/);
+          for (let i = 0; i < completeLines.length; i++) {
+            if (i & 1) {
+              if (lineEnding !== 'Mixed')
+                if (lineEnding) {
+                  if (completeLines[i] !== lineEnding)
+                    lineEnding = 'Mixed';
+                } else
+                  lineEnding = completeLines[i] as '\r' | '\n' | '\r\n';
+            } else {
+              let line = completeLines[i];
+              if (lineCount >= startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
+                lineLength = line.length;
+                let colOffset;
+                if (lineCount === startLine && startCol) {
+                  line = line.slice(startCol);
+                  colOffset = startCol;
+                } else
+                  colOffset = 0;
+                if (textLength + line.length > maxSize) {
+                  line = line.slice(0, maxSize - textLength);
+                  truncatedAt = {
+                    line: lineCount,
+                    col: colOffset + line.length,
+                    lineLength,
+                    nextLine: lineCount,
+                    nextCol: colOffset + line.length,
+                  };
+                  truncated = true;
+                } else if (textLength + line.length === maxSize) {
+                  truncatedAt = {
+                    line: lineCount,
+                    col: colOffset + line.length,
+                    lineLength,
+                    nextLine: lineCount + 1,
+                    nextCol: 0,
+                  };
+                  truncated = true;
+                }
+                lines.push(line);
+                textLength += line.length;
               }
-              lines.push(line);
-              textLength += line.length;
+              lineCount++;
             }
-            lineCount++;
           }
         } else {
           if (textLength >= maxSize && !truncated) {
-            lineLength += firstLineBreakPos! + 1;
+            lineLength += firstLineBreakPos!;
             if (truncatedAt)
               truncatedAt.lineLength = lineLength;
             else {
@@ -321,7 +335,7 @@ export async function readFile(
           }
           lineCount += chunkLineCount;
         }
-        remainingText = text.slice(lastLineBreakPos! + 1);
+        remainingText = text.slice(lastLineBreakPos! + 1).replace('\n', '');
         lineLength = remainingText.length;
       } else {
         remainingText = text;
@@ -369,6 +383,8 @@ export async function readFile(
       totalLines: lineCount,
       lines
     };
+    if (lineEnding)
+      result.lineEnding = lineEnding;
     if (truncatedAt) {
       result.truncatedAt = {
         line: truncatedAt.line,
