@@ -4,19 +4,24 @@ import { randomBytes } from 'crypto';
 import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
-import { isPathWithinAllowedDirectories } from './path-validation.js';
+import { isPathAllowed } from './path-validation.js';
 
-// Global allowed directories - set by the main module
-let allowedDirectories: string[] = [];
+// Global allowed paths - set by the main module
+let allowedPaths = new Set<string>();
+let readOnlyPaths = new Set<string>();
+let forbiddenPaths = new Set<string>();
 
-// Function to set allowed directories from the main module
-export function setAllowedDirectories(directories: string[]): void {
-  allowedDirectories = [...directories];
+// Function to set allowed paths from the main module
+export function setAllowedPaths(paths: Iterable<string>) {
+  allowedPaths = new Set(paths);
 }
 
-// Function to get current allowed directories
-export function getAllowedDirectories(): string[] {
-  return [...allowedDirectories];
+export function setReadOnlyPaths(paths: Iterable<string>) {
+  readOnlyPaths = new Set(paths);
+}
+
+export function setForbiddenPaths(paths: Iterable<string>) {
+  forbiddenPaths = new Set(paths);
 }
 
 // Type definitions
@@ -72,40 +77,49 @@ export function createUnifiedDiff(originalContent: string, newContent: string, f
 }
 
 // Helper function to resolve relative paths against allowed directories
-function resolveRelativePathAgainstAllowedDirectories(relativePath: string): string {
-  if (allowedDirectories.length === 0) {
+async function resolveRelativePathAgainstAllowedDirectories(relativePath: string, readOnly: boolean) {
+  let paths = [...allowedPaths, ...readOnlyPaths];
+  const predicates = await Promise.all(paths.map(async path => {
+    try {
+      return (await fs.stat(path)).isDirectory();
+    } catch {
+      return false;
+    }
+  }));
+  paths = paths.filter((_, i) => predicates[i]);
+  if (paths.length === 0) {
     // Fallback to process.cwd() if no allowed directories are set
     return path.resolve(process.cwd(), relativePath);
   }
 
   // Try to resolve relative path against each allowed directory
-  for (const allowedDir of allowedDirectories) {
+  for (const allowedDir of paths) {
     const candidate = path.resolve(allowedDir, relativePath);
     const normalizedCandidate = normalizePath(candidate);
 
     // Check if the resulting path lies within any allowed directory
-    if (isPathWithinAllowedDirectories(normalizedCandidate, allowedDirectories)) {
+    if (isPathAllowed(normalizedCandidate, allowedPaths, readOnlyPaths, forbiddenPaths, readOnly)) {
       return candidate;
     }
   }
 
   // If no valid resolution found, use the first allowed directory as base
   // This provides a consistent fallback behavior
-  return path.resolve(allowedDirectories[0], relativePath);
+  return path.resolve(allowedPaths.values().next().value!, relativePath);
 }
 
 // Security & Validation Functions
 async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<string> {
-  const allowedDirectory = [...allowedDirectories]
+  const paths = [...allowedPaths]
     .sort((left, right) => right.length - left.length)
-    .find(directory => isPathWithinAllowedDirectories(normalizePath(absolutePath), [directory]));
+    .find(directory => isPathAllowed(normalizePath(absolutePath), [directory], readOnlyPaths, forbiddenPaths, false));
 
-  if (!allowedDirectory) {
+  if (!paths) {
     return absolutePath;
   }
 
-  let currentPath = await fs.realpath(allowedDirectory);
-  const relativeParts = path.relative(allowedDirectory, absolutePath).split(path.sep).filter(Boolean);
+  let currentPath = await fs.realpath(paths);
+  const relativeParts = path.relative(paths, absolutePath).split(path.sep).filter(Boolean);
 
   for (let index = 0; index < relativeParts.length; index++) {
     const requestedPart = relativeParts[index];
@@ -127,15 +141,15 @@ async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<strin
     }
 
     currentPath = await fs.realpath(path.join(currentPath, equivalentMatches[0]));
-    if (!isPathWithinAllowedDirectories(normalizePath(currentPath), allowedDirectories)) {
-      throw new Error(`Access denied - symlink target outside allowed directories: ${currentPath} not in ${allowedDirectories.join(', ')}`);
+    if (!isPathAllowed(normalizePath(currentPath), allowedPaths, readOnlyPaths, forbiddenPaths, false)) {
+      throw new Error(`Access denied - symlink target outside allowed paths: ${currentPath} not in ${[...allowedPaths].join(', ')}`);
     }
   }
 
   return currentPath;
 }
 
-export async function validatePath(requestedPath: string): Promise<string> {
+export async function validatePath(requestedPath: string, readOnly: boolean): Promise<string> {
   const expandedPath = expandHome(requestedPath);
   // Do not silently reinterpret a Windows drive path as a relative POSIX path.
   // This would create a literal filename such as `C:\\Users\\...` inside the
@@ -145,24 +159,27 @@ export async function validatePath(requestedPath: string): Promise<string> {
   }
   const absolute = path.isAbsolute(expandedPath)
     ? path.resolve(expandedPath)
-    : resolveRelativePathAgainstAllowedDirectories(expandedPath);
+    : await resolveRelativePathAgainstAllowedDirectories(expandedPath, readOnly);
 
   const normalizedRequested = normalizePath(absolute);
 
-  // Security: Check if path is within allowed directories before any file operations
-  const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
-  if (!isAllowed) {
-    throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(', ')}`);
-  }
+  // Security: Check if path is within allowed paths before any file operations
+  const isAllowed = isPathAllowed(normalizedRequested, allowedPaths, readOnlyPaths, forbiddenPaths, readOnly);
+  if (isAllowed === null)
+    throw new Error(`Access denied - path outside allowed paths: ${absolute} not in ${[...allowedPaths].join(', ')}`);
+  else if (!isAllowed)
+    throw new Error(`Access denied - path inside forbidden paths: ${absolute} in ${[...forbiddenPaths].join(', ')}`);
 
   // Security: Handle symlinks by checking their real path to prevent symlink attacks
-  // This prevents attackers from creating symlinks that point outside allowed directories
+  // This prevents attackers from creating symlinks that point outside allowed paths
   try {
     const realPath = await fs.realpath(absolute);
     const normalizedReal = normalizePath(realPath);
-    if (!isPathWithinAllowedDirectories(normalizedReal, allowedDirectories)) {
-      throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
-    }
+    const isAllowed = isPathAllowed(normalizedReal, allowedPaths, readOnlyPaths, forbiddenPaths, readOnly);
+    if (isAllowed === null)
+      throw new Error(`Access denied - symlink target outside allowed paths: ${realPath} not in ${[...allowedPaths].join(', ')}`);
+    else if (!isAllowed)
+      throw new Error(`Access denied - symlink target inside forbidden paths: ${realPath} in ${[...forbiddenPaths].join(', ')}`);
     return realPath;
   } catch (error) {
     // Security: For new files that don't exist yet, verify parent directory
@@ -927,8 +944,6 @@ export async function searchFilesWithValidation(
       const fullPath = path.join(currentPath, entry.name);
 
       try {
-        await validatePath(fullPath);
-
         const relativePath = path.relative(rootPath, fullPath);
         const shouldExclude = excludePatterns.some(excludePattern =>
           minimatch(relativePath, excludePattern, { dot: true })
@@ -942,6 +957,7 @@ export async function searchFilesWithValidation(
         }
 
         if (entry.isDirectory()) {
+          await validatePath(fullPath, true);
           await search(fullPath);
         }
       } catch {

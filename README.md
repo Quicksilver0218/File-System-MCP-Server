@@ -1,5 +1,6 @@
 # File-System-MCP-Server
 A fork of https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+
 ## Usage
 ```json
 {
@@ -11,7 +12,8 @@ A fork of https://github.com/modelcontextprotocol/servers/tree/main/src/filesyst
         "all",
         "-y",
         "github:Quicksilver0218/File-System-MCP-Server",
-        "${env:VSCODE_CWD}" // or "%VSCODE_CWD%"
+        "${env:VSCODE_CWD}", // or "+%VSCODE_CWD%"
+        "*${env:VSCODE_CWD}/.git"
       ]
     }
   }
