@@ -832,6 +832,31 @@ registerTool(
 );
 
 registerTool(
+  "copy_file",
+  {
+    title: "Copy File",
+    description:
+      "Copy files and directories. Can copy files between directories " +
+      "and rename them in a single operation. If the destination exists, the " +
+      "operation will fail.",
+    inputSchema: MoveOrCopyFileArgsSchema,
+    outputSchema: { content: z.string() },
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof MoveOrCopyFileArgsSchema>) => {
+    const validSourcePath = await validatePath(args.source, true);
+    const validDestPath = await validatePath(args.destination, false);
+    await fs.cp(validSourcePath, validDestPath, { recursive: true, force: false, errorOnExist: true });
+    const text = `Successfully copied ${args.source} to ${args.destination}`;
+    const contentBlock = { type: "text" as const, text };
+    return {
+      content: [contentBlock],
+      structuredContent: { content: text }
+    };
+  }
+);
+
+registerTool(
   "search_files",
   {
     title: "Search Files",

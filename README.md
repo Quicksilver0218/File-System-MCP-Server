@@ -40,6 +40,7 @@ When conflicts occur, the strictest rule is applied.
 ### Write
 - edit_text_file
 - write_file
+- edit_file
 - remove_files
 - create_directory
 - move_file
