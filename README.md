@@ -29,13 +29,14 @@ Paths with a prefix can be added to the arguments to limit access to specific di
 When conflicts occur, the strictest rule is applied.
 
 ## Tools
-17 tools are available:
+18 tools are available:
 
 ### Read
 - read_text_file
 - read_media_file
 - read_multiple_files
 - find_text_in_file
+- find_text_in_directory
 
 ### Write
 - edit_text_file

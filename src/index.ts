@@ -30,6 +30,9 @@ import {
   searchText,
   setForbiddenPaths,
   setReadOnlyPaths,
+  TextSearchResult,
+  getFilesRecursive,
+  readFileAsBase64Stream,
 } from './lib.js';
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 
@@ -190,6 +193,18 @@ const SearchTextInFileArgsSchema = z.object({
     'Case-sensitive matching. Defaults to false.'
   )
 })
+
+const SearchTextInDirectoryArgsSchema = z.object({
+  path: z.string().describe(
+    'Path of the directory to search; must resolve inside an allowed directory. Prefer absolute paths.'
+  ),
+  pattern: z.string().describe(
+    'JavaScript RegExp (flags g and m, plus i unless caseSensitive). Escape metacharacters ' +
+    'for a literal search; an invalid pattern fails the call.'
+  ),
+  caseSensitive: z.boolean().optional().describe('Case-sensitive matching. Defaults to false.'),
+  recursive: z.boolean().optional().describe('If true, search recursively through subdirectories. Defaults to false.')
+});
 
 const RemoveFilesArgsSchema = z.object({
   paths: z
@@ -565,6 +580,81 @@ registerTool(
       `\nend: ${result.end}`;
     if (result.note)
       text += `\nnote: ${result.note}`;
+    return {
+      content: [{ type: "text" as const, text }]
+    };
+  }
+);
+
+registerTool(
+  "find_text_in_directory",
+  {
+    title: "Find Text in Directory",
+    description: [
+      "Search every file in a directory for a pattern and report matches grouped by file. " +
+      "pattern is a JavaScript RegExp (flags g, m, plus i unless caseSensitive); escape " +
+      "metacharacters for a literal search. Subdirectories are skipped unless recursive: true; " +
+      "directories themselves are never searched.",
+      "",
+      "Result: one block per file with at least one match, blocks separated by blank lines: " +
+      "'<file>: <n>' (returned count for that file, capped at 100; '>' prefix means the " +
+      "100-match cap was hit and more matches exist in that file), then one line per match " +
+      "<line>:<col>|<json_escaped_text> - line 1-indexed, col 0-indexed UTF-16 within the line, " +
+      "text JSON-escaped without outer quotes. Files with no matches are omitted; if no file " +
+      "matches, the response is 'No matches found', and a directory with no files returns " +
+      "'No files found in directory'. Fails when the directory holds more than 500 files. Use " +
+      "find_text_in_file with skip/maxResults to page through one file's matches, " +
+      "read_text_file to read around a match."
+    ].join('\n'),
+    inputSchema: SearchTextInDirectoryArgsSchema,
+    annotations: { readOnlyHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof SearchTextInDirectoryArgsSchema>) => {
+    const validPath = await validatePath(args.path, true);
+    const regex = new RegExp(args.pattern, args.caseSensitive ? 'gm' : 'gmi');
+    let files;
+    if (args.recursive)
+      files = await getFilesRecursive(validPath);
+    else
+      files = (await Promise.all((await fs.readdir(validPath, { withFileTypes: true }))
+        .filter(f => f.isFile()).map(async f => {
+          const fullPath = path.join(validPath, f.name);
+          try {
+            return await validatePath(fullPath, true);
+          } catch {
+            return null;
+          }
+        }))).filter(p => p) as string[];
+
+    const MAX_FILES = 500;
+    let text;
+    if (files.length === 0) {
+      text = "No files found in directory";
+    } else if (files.length > MAX_FILES)
+      throw new Error(`Too many files (>${MAX_FILES}) to search. Use a more specific directory instead.`);
+    else {
+      const BATCH_SIZE = 20;
+      let results = [];
+      for (let i = 0; i < files.length; i += BATCH_SIZE) {
+        const batch = files.slice(i, i + BATCH_SIZE);
+        results.push(...(await Promise.all(batch.map(async file => {
+          try {
+            const validFilePath = await validatePath(file, true);
+            return [validFilePath, await searchText(validFilePath, regex, { caseSensitive: args.caseSensitive })];
+          } catch {
+            return null;
+          }
+        }))).filter(r => r) as [string, TextSearchResult][]);
+      }
+      results = results.filter(r => r[1].results.length);
+
+      if (results.length) {
+        text = results.map(([file, result]) =>
+          `${file}: ${result.end ? '' : '>'}${result.results.length}` +
+          `${result.results.map(r => `\n${r.line}:${r.col}|${JSON.stringify(r.text).slice(1, -1)}`).join('')}`).join('\n\n');
+      } else
+        text = "No matches found";
+    }
     return {
       content: [{ type: "text" as const, text }]
     };

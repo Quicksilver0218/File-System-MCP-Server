@@ -5,6 +5,7 @@ import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathAllowed } from './path-validation.js';
+import { createReadStream } from "fs";
 
 // Global allowed paths - set by the main module
 let allowedPaths = new Set<string>();
@@ -838,15 +839,19 @@ export interface TextSearchResult {
 
 export async function searchText(
   filePath: string,
-  pattern: string,
+  pattern: string | RegExp,
   options: { maxResults?: number; skip?: number; caseSensitive?: boolean } = {}
 ): Promise<TextSearchResult> {
   const { maxResults = 100, caseSensitive = false } = options;
   let { skip = 0 } = options;
-  let flags = 'gm';
-  if (!caseSensitive)
-    flags += 'i';
-  const regex = new RegExp(pattern, flags);
+  let regex;
+  if (typeof pattern === 'string') {
+    let flags = 'gm';
+    if (!caseSensitive)
+      flags += 'i';
+    regex = new RegExp(pattern, flags);
+  } else
+    regex = pattern;
   const fileHandle = await fs.open(filePath, 'r');
   try {
     const chunk = Buffer.alloc(65536); // 64KB
@@ -871,19 +876,22 @@ export async function searchText(
       const bytes = chunk.subarray(0, result.bytesRead);
       const text = decoder.decode(bytes);
       const fullText = lastText + text;
-      const textToSearch = fullText.slice(0, Math.max(fullText.lastIndexOf('\n'), fullText.lastIndexOf('\r')) + 1);
+      const lastLinePos = Math.max(fullText.lastIndexOf('\n'), fullText.lastIndexOf('\r')) + 1;
+      const textToSearch = lastLinePos && result.bytesRead ? fullText.slice(0, lastLinePos) : fullText;
       const tokens = textToSearch.split(/(\r\n|\r|\n)/);
       let index = 0;
       let lineStart = 0;
-      let lineLength = tokens[index].length + tokens[index + 1].length;
+      let lineLength;
+      if (tokens[index + 1])
+        lineLength = tokens[index].length + tokens[index + 1].length;
       const matches = Array.from(textToSearch.matchAll(regex));
       for (const match of matches) {
-        while (lineStart + lineLength <= match.index) {
+        while (lineLength && lineStart + lineLength <= match.index) {
           lineStart += lineLength;
-          index += 2;
           lineCount++;
           lastCol = 0;
-          lineLength = tokens[index].length + tokens[index + 1].length;
+          index += 2;
+          lineLength = tokens[index + 1] ? tokens[index].length + tokens[index + 1].length : undefined;
         }
         if (skip)
           skip--;
@@ -897,13 +905,13 @@ export async function searchText(
       if (matches.length) {
         const match = matches[matches.length - 1];
         const continuePos = match.index + match[0].length;
-        while (lineStart + lineLength <= continuePos) {
+        while (lineLength && lineStart + lineLength <= continuePos) {
           lineStart += lineLength;
-          index += 2;
           lineCount++;
-          lineLength = tokens[index].length + tokens[index + 1].length;
+          index += 2;
+          lineLength = tokens[index + 1] ? tokens[index].length + tokens[index + 1].length : undefined;
         }
-        lastCol = continuePos - lineStart;
+        lastCol += continuePos - lineStart;
         lastText = fullText.slice(continuePos);
         if (match[0].endsWith('\r') && lastText.startsWith('\n'))
           lineCount--;
@@ -968,4 +976,22 @@ export async function searchFilesWithValidation(
 
   await search(rootPath);
   return results;
+}
+
+export async function getFilesRecursive(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  const files = await Promise.all(entries.map(async (entry) => {
+    const fullPath = path.join(dir, entry.name);
+    try {
+      const validPath = await validatePath(fullPath, true);
+      if (entry.isDirectory())
+        return getFilesRecursive(validPath);
+      return validPath;
+    } catch {
+      return [];
+    }
+  }));
+
+  return files.flat();
 }
