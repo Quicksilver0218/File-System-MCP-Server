@@ -1,11 +1,12 @@
-import fs from "fs/promises";
-import path from "path";
+import fs from 'fs/promises';
+import path from 'path';
+import { createReadStream } from 'fs';
+import { ExecException, execFile } from 'child_process';
+import { promisify } from 'util';
 import { randomBytes } from 'crypto';
-import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathAllowed } from './path-validation.js';
-import { createReadStream } from "fs";
 
 // Global allowed paths - set by the main module
 let allowedPaths = new Set<string>();
@@ -60,21 +61,6 @@ export function formatSize(bytes: number): string {
 
 export function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, '\n');
-}
-
-export function createUnifiedDiff(originalContent: string, newContent: string, filepath: string = 'file'): string {
-  // Ensure consistent line endings for diff
-  const normalizedOriginal = normalizeLineEndings(originalContent);
-  const normalizedNew = normalizeLineEndings(newContent);
-
-  return createTwoFilesPatch(
-    filepath,
-    filepath,
-    normalizedOriginal,
-    normalizedNew,
-    'original',
-    'modified'
-  );
 }
 
 // Helper function to resolve relative paths against allowed directories
@@ -241,12 +227,12 @@ export async function readFile(
 ): Promise<FileReadResult> {
   const { startLine = 1, endLine, startCol, maxSize = 25000 } = options;
   if (endLine && endLine < startLine)
-    throw new Error("endLine must be greater than or equal to startLine");
+    throw new Error('endLine must be greater than or equal to startLine');
 
   const fileHandle = await fs.open(filePath, 'r');
   try {
     let pendingLine = '';
-    const chunk = Buffer.alloc(65536); // 64KB buffer
+    const chunk = Buffer.alloc(65536); // 64 KB buffer
     const decoder = new TextDecoder();
     let offset = 0;
     let lineCount = 1;
@@ -443,27 +429,27 @@ export async function readFileAsBase64Stream(filePath: string): Promise<string> 
 }
 
 export interface FileEditResult {
-  modified: {
-    type: '+' | '-';
-    line: number;
-    text: string;
-  }[];
+  diff: string;
   note?: string;
+}
+
+interface FileEdit {
+  oldText?: string;
+  newText?: string;
+  startLine?: number;
+  startCol?: number;
 }
 
 export async function editFile(
   filePath: string,
-  edits: { line: number, delete?: boolean, col?: number | 'end', text?: string, deleteText?: string | number | boolean }[],
+  edits: FileEdit[],
   dryRun?: boolean
 ): Promise<FileEditResult> {
-  const origStats = await fs.stat(filePath);
-  if (!origStats.isFile())
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile())
     throw new Error(`File (${filePath}) does not exist or is not a file`);
-  const editMap = new Map(edits.map(e => [e.line, e]));
-  if (editMap.size !== edits.length)
-    throw new Error(`Duplicate line numbers found in edits`);
-  const fileHandle = await fs.open(filePath, 'r+');
-
+  edits.sort((a, b) => (b.startLine ?? 1) - (a.startLine ?? 1) || (b.startCol ?? 0) - (a.startCol ?? 0));
+  const fileHandle = await fs.open(filePath, 'r');
   let outFileSuffix = 0;
   try {
     while (true) {
@@ -473,187 +459,159 @@ export async function editFile(
   } catch { }
   let outFileHandle;
   try {
-    const chunk = Buffer.alloc(65536); // 64KB buffer
+    const chunk = Buffer.alloc(65536); // 64 KB buffer
     const decoder = new TextDecoder();
-    if (!dryRun)
-      outFileHandle = await fs.open(`${filePath}${outFileSuffix}`, 'a');
-    let pendingLine = '';
-    let offset = 0;
-    let srcLineCount = 1, distLineCount = 1;
+    outFileHandle = await fs.open(`${filePath}${outFileSuffix}`, 'a');
+
     const notes = [];
-    const modified: { type: '+' | '-', line: number, text: string }[] = [];
 
-    const formatColAndDeleteCount = (lineLength: number, col?: number | 'end', deleteText?: string | number | boolean) => {
-      if (col) {
-        if (col === 'end')
-          col = lineLength;
-        else if (col > lineLength)
-          throw new Error(`Edit column ${col} is out of bounds for line ${srcLineCount}`);
-        else if (col < 0) {
-          const oCol = col;
-          col += lineLength;
-          if (col < 0)
-            throw new Error(`Edit column ${oCol} is out of bounds for line ${srcLineCount}`);
-        }
-      } else
-        col = 0;
-      if (deleteText) {
-        if (deleteText === true)
-          deleteText = Infinity;
-        else if (typeof deleteText === 'number' && deleteText < 0) {
-          const deleteCount = deleteText;
-          deleteText += lineLength - col;
-          if (deleteText < 0)
-            throw new Error(`Edit delete text count ${deleteCount} is out of negative bound for line ${srcLineCount}`);
-        }
-      } else
-        deleteText = 0;
-      return { col, deleteText };
-    };
-
-    let hasChange = false;
-    let maxEditLine = 0;
-    let lastLineEnding;
-    for (const lineNumber of editMap.keys()) {
-      if (!hasChange && lineNumber === 1)
-        hasChange = true;
-      if (lineNumber > maxEditLine)
-        maxEditLine = lineNumber;
-    }
+    const readResult = await fileHandle.read(chunk, 0, chunk.length, 0);
+    const bytes = chunk.subarray(0, readResult.bytesRead);
+    const nullPos = bytes.indexOf(0);
+    if (nullPos !== -1)
+      notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled.`);
+    let lastText = decoder.decode(bytes);
+    let offset = readResult.bytesRead;
+    let lineCount = 1;
+    let lastCol = 0;
+    const replacements = [];
+    let startPos = 0;
     while (true) {
       const result = await fileHandle.read(chunk, 0, chunk.length, offset);
-      if (result.bytesRead === 0) break; // End of file
       const bytes = chunk.subarray(0, result.bytesRead);
-      if (!offset) {
-        const nullPos = bytes.indexOf(0);
-        if (nullPos !== -1)
-          notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled.`);
-      }
       const text = decoder.decode(bytes);
-
-      let chunkLineCount = 0;
-      let end;
-      for (let i = 0; i < text.length; i++)
-        if (text[i] === '\n' || text[i] === '\r') {
-          end = i + 1;
-          if (text[i] === '\n' && text[i - 1] !== '\r' || text[i] === '\r')
-            chunkLineCount++;
-        }
-      if (chunkLineCount) {
-        hasChange = false;
-        for (const lineNumber of editMap.keys())
-          if (srcLineCount <= lineNumber && srcLineCount + chunkLineCount > lineNumber) {
-            hasChange = true;
-            break;
-          }
-        if (hasChange) {
-          const completeLines = (pendingLine + text.slice(0, end)).split(/(\r\n|\n|\r)/);
-          for (let i = 0; i < completeLines.length - 1; i += 2) {
-            const line = completeLines[i];
-            const lineEnding = completeLines[i + 1];
-            const edit = editMap.get(srcLineCount);
-            if (edit) {
-              modified.push({ type: '-', line: srcLineCount, text: line });
-              if (!edit.delete) {
-                let newLine = '';
-                const { col, deleteText } = formatColAndDeleteCount(line.length, edit.col, edit.deleteText);
-                newLine = line.slice(0, col);
-                if (edit.text)
-                  newLine += edit.text;
-                if (typeof deleteText === 'number')
-                  newLine += line.slice(col + deleteText);
-                else
-                  newLine += line.slice(col).replace(deleteText, '');
-                const lines = newLine.split(/(\r\n|\n|\r)/);
-                for (let i = 0; i < lines.length; i += 2) {
-                  if (
-                    // If the text starts with \n and lastLineEnding is \r, they are combined to a line terminator
-                    lastLineEnding === '\r' && !i && !lines[i] && lines[i + 1] === '\n' ||
-                    // If the text ends with \r and lineEnding is \n, they are combined to a line terminator
-                    lines[i - 1] === '\r' && i === lines.length - 1 && !lines[i] && lineEnding === '\n'
-                  )
-                    continue;
-                  modified.push({ type: '+', line: distLineCount, text: lines[i] });
-                  distLineCount++;
+      const fullText = lastText + text;
+      const tokens = lastText.split(/(\r\n|\r|\n)/);
+      const tokensLineCount = tokens.length / 2 | 0;
+      let outText = '';
+      if (lineCount + tokensLineCount >= (edits[0]?.startLine ?? 1)) {
+        let remainingText = fullText;
+        let slicedLen = 0;
+        for (let i = 0; i < tokens.length - 1 || i < tokens.length && !result.bytesRead; i += 2) {
+          for (let j = edits.length - 1; j >= 0; j--) {
+            if (lineCount < (edits[j].startLine ?? 1))
+              break;
+            let startCol = lineCount === (edits[j].startLine ?? 1) ? Math.max(0, (edits[j].startCol ?? 0) - lastCol) : 0;
+            if (lineCount === (edits[j].startLine ?? 1)) {
+              startCol = (edits[j].startCol ?? 0) - lastCol;
+              if (startCol < 0)
+                startCol = 0;
+              else if (startCol > tokens[i].length && (tokens[i + 1] || !result.bytesRead))
+                startCol = tokens[i].length;
+            } else
+              startCol = 0;
+            const throwError = (replacement: { edit: FileEdit }) => {
+              throw new Error(`Edit ${JSON.stringify(edits[j])} overlaps with ${JSON.stringify(replacement.edit)}`)
+            };
+            if (edits[j].oldText) {
+              const match = remainingText.slice(startCol).match(new RegExp(RegExp.escape(edits[j].oldText!)
+                .split('\\\\').map(part => part.replaceAll(/\\r\\n|\\r|\\n/ig, '(?:\\r\\n|\\r|\\n)')).join('\\\\')));
+              if (match) {
+                const startPos = slicedLen + startCol + match.index!;
+                const endPos = startPos + match[0].length;
+                let inserted = false;
+                if (replacements.length)
+                  for (let k = 0; k < replacements.length; k++)
+                    if (startPos >= replacements[k].startPos) {
+                      if (startPos < replacements[k].endPos)
+                        throwError(replacements[k]);
+                      replacements.splice(k, 0, { edit: edits[j], startPos, endPos });
+                      inserted = true;
+                      break;
+                    }
+                if (!inserted) {
+                  if (replacements.length && endPos > replacements[replacements.length - 1].startPos)
+                    throwError(replacements[replacements.length - 1]);
+                  replacements.push({ edit: edits[j], startPos, endPos });
                 }
-                newLine += lineEnding;
-                if (outFileHandle)
-                  await outFileHandle.appendFile(newLine);
+                edits.splice(j, 1);
               }
             } else {
-              distLineCount++;
-              if (outFileHandle)
-                await outFileHandle.appendFile(line + lineEnding);
+              if (edits[j].newText) {
+                const startPos = slicedLen + startCol;
+                let inserted = false;
+                if (replacements.length)
+                  for (let k = 0; k < replacements.length; k++)
+                    if (startPos > replacements[k].startPos) {
+                      if (startPos < replacements[k].endPos)
+                        throwError(replacements[k]);
+                      replacements.splice(k, 0, { edit: edits[j], startPos, endPos: startPos });
+                      inserted = true;
+                      break;
+                    }
+                if (!inserted)
+                  replacements.push({ edit: edits[j], startPos, endPos: startPos });
+              }
+              edits.splice(j, 1);
             }
-            srcLineCount++;
-            lastLineEnding = lineEnding;
           }
-          hasChange = false;
-        } else {
-          srcLineCount += chunkLineCount;
-          distLineCount += chunkLineCount;
-          lastLineEnding = text[end! - 1];
-          if (outFileHandle)
-            await outFileHandle.appendFile(text.slice(0, end));
-        }
-        for (const lineNumber of editMap.keys())
-          if (srcLineCount === lineNumber) {
-            hasChange = true;
+          if (!tokens[i + 1])
             break;
-          }
-        pendingLine = text.slice(end);
-        if (!hasChange) {
-          if (outFileHandle)
-            await outFileHandle.appendFile(pendingLine);
-          pendingLine = '';
+          const consumed = tokens[i].length + tokens[i + 1].length;
+          remainingText = remainingText.slice(consumed);
+          slicedLen += consumed;
+          lineCount++;
+          lastCol = 0;
         }
+        for (let i = replacements.length - 1; i >= 0; i--) {
+          if (replacements[i].startPos <= lastText.length) {
+            outText += fullText.slice(startPos, replacements[i].startPos) + (replacements[i].edit.newText ?? '');
+            startPos = replacements[i].endPos;
+            replacements.splice(i, 1);
+          } else
+            break;
+        }
+        for (const replacement of replacements) {
+          replacement.startPos -= lastText.length;
+          replacement.endPos -= lastText.length;
+        }
+        if (startPos < lastText.length) {
+          outText += lastText.slice(startPos);
+          startPos = 0;
+        } else
+          startPos -= lastText.length;
       } else {
-        if (hasChange)
-          pendingLine += text;
-        else if (outFileHandle)
-          await outFileHandle.appendFile(bytes);
+        lineCount += tokensLineCount;
+        outText = lastText;
+        startPos = 0;
       }
+      await outFileHandle.appendFile(outText);
+
+      if (result.bytesRead === 0) break; // End of file
       offset += result.bytesRead;
+
+      if (tokens.length > 1) {
+        if (outText.endsWith('\r') && text.startsWith('\n'))
+          lineCount--;
+        lastCol = tokens[tokens.length - 1].length;
+      } else
+        lastCol += lastText.length;
+      lastText = text;
     }
-    if (hasChange) {
-      const edit = editMap.get(srcLineCount)!;
-      modified.push({ type: '-', line: srcLineCount, text: pendingLine });
-      if (!edit.delete) {
-        let newLine = '';
-        const { col, deleteText } = formatColAndDeleteCount(pendingLine.length, edit.col, edit.deleteText);
-        newLine = pendingLine.slice(0, col);
-        if (edit.text)
-          newLine += edit.text;
-        if (typeof deleteText === 'number')
-          newLine += pendingLine.slice(col + deleteText);
-        else
-          newLine += pendingLine.slice(col).replace(deleteText, '');
-        const lines = newLine.split(/(\r\n|\n|\r)/);
-        for (let i = 0; i < lines.length; i += 2) {
-          // If the text starts with \n and lastLineEnding is \r, they are combined to a line terminator
-          if (lastLineEnding === '\r' && !i && !lines[i] && lines[i + 1] === '\n')
-            continue;
-          modified.push({ type: '+', line: distLineCount, text: lines[i] });
-          distLineCount++;
-        }
-        if (outFileHandle)
-          await outFileHandle.appendFile(newLine);
-      }
-    }
-    if (maxEditLine > srcLineCount)
-      notes.push(`Edit lines with line number greater than total lines (${srcLineCount}) are not processed.`);
-    const output: FileEditResult = { modified };
-    if (notes.length)
-      output.note = notes.join('\n');
 
     await fileHandle.close();
-    if (outFileHandle) {
-      await outFileHandle.close();
+    await outFileHandle.close();
+    let output: FileEditResult;
+    try {
+      const { stdout } = await promisify(execFile)(
+        process.env.GIT_PATH ?? 'git',
+        ['diff', '--no-index', filePath, `${filePath}${outFileSuffix}`]
+      );
+      output = { diff: stdout.slice(stdout.indexOf('@@')) };
+    } catch (e) {
+      if ((e as ExecException).code === 1) {
+        const stdout = (e as { stdout: string }).stdout;
+        output = { diff: stdout.slice(stdout.indexOf('@@')) };
+      } else
+        output = { diff: 'File comparison is not available.' + dryRun ? '' : ' Read the file to see the changes.' };
+    }
+
+    if (!dryRun) {
       await fs.rename(filePath, `${filePath}.bak`);
       try {
         await fs.rename(`${filePath}${outFileSuffix}`, filePath);
         try {
-          await fs.chmod(filePath, origStats.mode & 0o777);
+          await fs.chmod(filePath, stat.mode & 0o777);
         } catch { }
         try {
           await fs.rm(`${filePath}.bak`);
@@ -663,6 +621,11 @@ export async function editFile(
         throw e;
       }
     }
+
+    if (edits.length)
+      notes.push(`${edits.length} edits were not applied because the oldTexts were not found in the file.`);
+    if (notes.length)
+      output.note = notes.join('\n');
     return output;
   } finally {
     await fileHandle.close();
@@ -677,7 +640,7 @@ export async function writeFileContent(filePath: string, content: string): Promi
   try {
     // Security: 'wx' flag ensures exclusive creation - fails if file/symlink exists,
     // preventing writes through pre-existing symlinks
-    await fs.writeFile(filePath, content, { encoding: "utf-8", flag: 'wx' });
+    await fs.writeFile(filePath, content, { encoding: 'utf-8', flag: 'wx' });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       // Security: Use atomic rename to prevent race conditions where symlinks
@@ -726,111 +689,6 @@ export async function moveFile(sourcePath: string, destinationPath: string): Pro
   throw new Error(`Destination already exists: ${destinationPath}`);
 }
 
-
-// File Editing Functions
-interface FileEdit {
-  oldText: string;
-  newText: string;
-}
-
-export async function applyFileEdits(
-  filePath: string,
-  edits: FileEdit[],
-  dryRun: boolean = false
-): Promise<string> {
-  // Read file content and normalize line endings
-  const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
-
-  // Apply edits sequentially
-  let modifiedContent = content;
-  for (const edit of edits) {
-    const normalizedOld = normalizeLineEndings(edit.oldText);
-    const normalizedNew = normalizeLineEndings(edit.newText);
-
-    // If exact match exists, use it
-    if (modifiedContent.includes(normalizedOld)) {
-      modifiedContent = modifiedContent.replace(normalizedOld, () => normalizedNew);
-      continue;
-    }
-
-    // Otherwise, try line-by-line matching with flexibility for whitespace
-    const oldLines = normalizedOld.split('\n');
-    const contentLines = modifiedContent.split('\n');
-    let matchFound = false;
-
-    for (let i = 0; i <= contentLines.length - oldLines.length; i++) {
-      const potentialMatch = contentLines.slice(i, i + oldLines.length);
-
-      // Compare lines with normalized whitespace
-      const isMatch = oldLines.every((oldLine, j) => {
-        const contentLine = potentialMatch[j];
-        return oldLine.trim() === contentLine.trim();
-      });
-
-      if (isMatch) {
-        // Preserve original indentation of first line
-        const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
-        const newLines = normalizedNew.split('\n').map((line, j) => {
-          if (j === 0) return originalIndent + line.trimStart();
-          // For subsequent lines, try to preserve relative indentation
-          const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
-          const newIndent = line.match(/^\s*/)?.[0] || '';
-          if (oldIndent && newIndent) {
-            const relativeIndent = newIndent.length - oldIndent.length;
-            return originalIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
-          }
-          return line;
-        });
-
-        contentLines.splice(i, oldLines.length, ...newLines);
-        modifiedContent = contentLines.join('\n');
-        matchFound = true;
-        break;
-      }
-    }
-
-    if (!matchFound) {
-      throw new Error(`Could not find exact match for edit:\n${edit.oldText}`);
-    }
-  }
-
-  // Create unified diff
-  const diff = createUnifiedDiff(content, modifiedContent, filePath);
-
-  // Format diff with appropriate number of backticks
-  let numBackticks = 3;
-  while (diff.includes('`'.repeat(numBackticks))) {
-    numBackticks++;
-  }
-  const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
-
-  if (!dryRun) {
-    // Security: Use atomic rename to prevent race conditions where symlinks
-    // could be created between validation and write. Rename operations
-    // replace the target file atomically and don't follow symlinks.
-    const origStats = await fs.stat(filePath);
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch { }
-      throw error;
-    }
-    // Restore original permission bits since the atomic rename replaces the
-    // inode and the temp file has default (0644) permissions. Mask off the
-    // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-    // failure must not fail the write, which has already succeeded.
-    try {
-      await fs.chmod(filePath, origStats.mode & 0o777);
-    } catch { }
-  }
-
-  return formattedDiff;
-}
-
 export interface TextSearchResult {
   results: { line: number; col: number; text: string }[];
   end: boolean;
@@ -854,7 +712,7 @@ export async function searchText(
     regex = pattern;
   const fileHandle = await fs.open(filePath, 'r');
   try {
-    const chunk = Buffer.alloc(65536); // 64KB
+    const chunk = Buffer.alloc(65536); // 64 KB
     const decoder = new TextDecoder();
     const results: { line: number; col: number; text: string }[] = [];
     let end = true;

@@ -24,7 +24,6 @@ import {
   writeFileContent,
   moveFile,
   searchFilesWithValidation,
-  applyFileEdits,
   setAllowedPaths,
   editFile,
   searchText,
@@ -119,26 +118,13 @@ const EditTextFileArgsSchema = z.object({
     'against the allowed directories. Must resolve inside an allowed directory.'
   ),
   edits: z.array(z.object({
-    line: z.number().int().min(1, 'line must be >= 1 (lines are 1-indexed)').describe('1-indexed line number to edit'),
-    delete: z.boolean().optional().describe('If true, delete the line and ignore col, text and deleteText.'),
-    col: z.union([
-      z.number().int(),
-      z.enum(['end'])
-    ]).optional().describe(
-      '0-indexed UTF-16 offset applied to the line. Negative index counts back ' +
-      'from the end of the line (including line breaks). Can also input ' +
-      "'end' to represent the end of the line. Defaults to 0."
-    ),
-    text: z.string().optional().describe('New text to insert at the given position. Optional.'),
-    deleteText: z.union([
-      z.number().int(),
-      z.string(),
-      z.boolean()
-    ]).optional().describe(
-      'Specifies deletion behavior: a number sets the character length (negative counts from the end), ' +
-      'a string targets its first occurrence, true represents the maximum length, and false is ignored.'
+    oldText: z.string().optional().describe('Text to be removed; omit it to insert newText at startCol'),
+    newText: z.string().optional().describe('Text to be inserted in place of oldText; omit it to delete the matched text'),
+    startLine: z.number().int().min(1, 'line must be >= 1 (lines are 1-indexed)').optional().describe('1-indexed line number to start edit'),
+    startCol: z.number().int().optional().describe(
+      '0-indexed UTF-16 offset applied to the startLine.  Defaults to 0.'
     )
-  })).min(1, "At least one edit must be provided").describe('Edits to apply to the file. Only one edit per line is allowed.'),
+  })).min(1, "At least one edit must be provided").describe('Edits to apply to the file.'),
   dryRun: z.boolean().optional().describe('If true, do not actually write the file.')
 });
 
@@ -343,7 +329,12 @@ registerTool(
       "",
       "maxSize (0-25000, default 25000) counts UTF-16 units of line content without terminators and " +
       "only caps the payload; the file is still scanned to EOF, so totalLines is exact. Prefer " +
-      "ranges over huge files."
+      "ranges over huge files.",
+      "",
+      "Edge cases:\n" +
+      "- If startLine exceeds totalLines, returns empty content with a note warning.",
+      "- If startCol exceeds line length, returns from the end of that line.",
+      "- Empty files return 1 line with empty content."
     ].join('\n'),
     inputSchema: ReadTextFileArgsSchema,
     annotations: { readOnlyHint: true, openWorldHint: false }
@@ -373,14 +364,19 @@ registerTool(
   {
     title: "Edit Text File",
     description:
-      "Line/column-addressed edits: each edit targets one 1-indexed line (duplicates " +
-      "rejected) to insert text, delete characters, or delete the whole line; lines past " +
-      "EOF are skipped, original line endings preserved. Use when you know exact positions " +
-      "(e.g. from read_text_file); if you only know the text to change, use edit_file " +
-      "instead (search-and-replace returning a git-style diff). " +
-      "Result: modified lines as <sign><line_number>|<text>, where '-' rows give the " +
-      "BEFORE-edit line number (old text) and '+' rows the AFTER-edit line number (new " +
-      "text); a note is appended when relevant.",
+      "Edit a file by search-and-replace with optional line/column anchoring. Each edit in the " +
+      "edits array is applied in order. For each edit:\n" +
+      "- If oldText is provided: find the first occurrence of oldText (starting from startLine/startCol " +
+      "if specified) and replace it with newText. Omit newText or pass empty string to delete the match.\n" +
+      "- If oldText is omitted: insert newText at startLine/startCol position (insertion mode).\n" +
+      "Key behaviors:\n" +
+      "- Newlines inside oldText match any line-ending style (LF, CRLF, or CR).\n" +
+      "- newText is inserted verbatim without line-ending normalization.\n" +
+      "- Only the first occurrence from the search start is replaced, so include context to make it unique.\n" +
+      "- Edits apply together atomically: if any oldText is not found, ALL edits are skipped and " +
+      "reported in a note, leaving the file unchanged. Overlapping edits also fail the whole call.\n" +
+      "- dryRun previews the diff without writing. The write is atomic (uses temp file + rename).\n" +
+      "- Returns a git-style diff showing the changes.",
     inputSchema: EditTextFileArgsSchema,
     annotations: { destructiveHint: true, openWorldHint: false }
   },
@@ -388,7 +384,7 @@ registerTool(
     const validPath = await validatePath(args.path, false);
 
     const result = await editFile(validPath, args.edits, args.dryRun);
-    let text = `modified:${result.modified.sort((a, b) => a.line - b.line).map(item => `\n${item.type}${item.line}|${item.text}`).join('')}`;
+    let text = `\`\`\`diff\n${result.diff}\n\`\`\``;
     if (result.note)
       text += `\nnote: ${result.note}`;
 
@@ -520,33 +516,6 @@ registerTool(
     return {
       content: [{ type: "text" as const, text }],
       structuredContent: { content: text }
-    };
-  }
-);
-
-registerTool(
-  "edit_file",
-  {
-    title: "Edit File",
-    description:
-      "Search-and-replace edits addressed by CONTENT, not line numbers: find oldText and " +
-      "replace it with newText. Use when you know WHAT to change but not WHERE; use " +
-      "edit_text_file when you have exact line/column positions (it returns modified lines " +
-      "instead of a diff). Edits apply in order; only the first occurrence of oldText is " +
-      "replaced, so include context to make it unique (whitespace-insensitive line matching " +
-      "is the fallback). If oldText is not found the call fails and the file is unchanged. " +
-      "Returns a git-style diff; dryRun previews without writing. Write is atomic and " +
-      "normalizes line endings to LF.",
-    inputSchema: EditFileArgsSchema,
-    outputSchema: { content: z.string() },
-    annotations: { destructiveHint: true, openWorldHint: false }
-  },
-  async (args: z.infer<typeof EditFileArgsSchema>) => {
-    const validPath = await validatePath(args.path, false);
-    const result = await applyFileEdits(validPath, args.edits, args.dryRun);
-    return {
-      content: [{ type: "text" as const, text: result }],
-      structuredContent: { content: result }
     };
   }
 );

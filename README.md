@@ -7,6 +7,9 @@ A fork of https://github.com/modelcontextprotocol/servers/tree/main/src/filesyst
   "mcpServers": {
     "File System": {
       "command": "npx",
+      // "env": {
+      //   "GIT_PATH": "/path/to/git",
+      // },
       "args": [
         "--allow-git",
         "all",
@@ -29,7 +32,7 @@ Paths with a prefix can be added to the arguments to limit access to specific di
 When conflicts occur, the strictest rule is applied.
 
 ## Tools
-18 tools are available:
+17 tools are available:
 
 ### Read
 - read_text_file
@@ -41,7 +44,6 @@ When conflicts occur, the strictest rule is applied.
 ### Write
 - edit_text_file
 - write_file
-- edit_file
 - remove_files
 - create_directory
 - move_file
